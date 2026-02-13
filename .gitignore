@@ -1,0 +1,6 @@
+/data/*
+/data/android_data/video.mov
+!data/android_data/
+
+
+
