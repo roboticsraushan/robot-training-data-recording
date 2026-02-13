@@ -16,6 +16,8 @@ DEFAULT_CAMERA_INTRINSICS = {'fx': 500, 'fy': 500, 'cx': 320, 'cy': 240, 'width'
 DEFAULT_SAMPLE_RATE = 1
 DEFAULT_DEPTH_DOWNSCALE = 1
 USE_GPU_BY_DEFAULT = True
+# Nominal scene distance (used to convert MiDaS relative depths → approximate meters)
+DEFAULT_NOMINAL_DEPTH_M = 1.0  # meters (adjustable)
 
 def load_data():
     with open('motion_data.json') as f:
@@ -87,15 +89,22 @@ def detect_hands(hands, rgb):
             hand_data[label] = {'landmarks_2d': landmarks_2d, 'confidence': confidence}
     return hand_data
 
-def estimate_depth(midas, midas_transforms, rgb, device=None, downscale: int = 1, timing_list=None):
-    """Run MiDaS on `rgb` and return a depth map at the original image resolution.
+def estimate_depth(midas, midas_transforms, rgb, device=None, downscale: int = 1, timing_list=None, nominal_depth_m: float = DEFAULT_NOMINAL_DEPTH_M):
+    """Run MiDaS on `rgb` and return a depth map and an adaptive metric scale.
 
-    Optionally records per-inference timings to `timing_list` (append, seconds).
+    Returns:
+      (depth_pred, depth_scale)
+      - depth_pred: MiDaS output (same units as before)
+      - depth_scale: multiplicative factor so that z_m = (1.0 / depth_pred) * depth_scale
+
+    The scale is computed per-frame by mapping the median of the *relative* depths
+    (1 / depth_pred) in the central image crop to `nominal_depth_m`.
 
     Args:
         device: torch device where `midas` is located (recommended).
         downscale: integer factor to downsample input before MiDaS (faster, lower res).
         timing_list: optional list to append per-inference elapsed seconds to.
+        nominal_depth_m: the scene distance (meters) that the median relative depth maps to.
     """
     # determine device
     if device is None:
@@ -135,9 +144,24 @@ def estimate_depth(midas, midas_transforms, rgb, device=None, downscale: int = 1
     if downscale != 1 and downscale > 0:
         depth_pred = cv2.resize(depth_pred, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-    return depth_pred
+    # --- compute adaptive metric scale for this frame ---
+    # MiDaS output can be treated as an 'inverse-depth-like' quantity; we compute
+    # inv = 1 / depth_pred and map its median to nominal_depth_m.
+    eps = 1e-6
+    depth_safe = np.clip(depth_pred, eps, None)
+    inv_map = 1.0 / depth_safe
 
-def lift_hands_to_3d(hand_data, depth, camera_matrix, image_shape=None):
+    # use a central crop to avoid sky/background outliers
+    h, w = inv_map.shape[:2]
+    y0, y1 = int(h * 0.25), int(h * 0.75)
+    x0, x1 = int(w * 0.25), int(w * 0.75)
+    crop = inv_map[y0:y1, x0:x1]
+    median_inv = float(np.median(crop)) if crop.size > 0 else float(np.median(inv_map))
+    depth_scale = nominal_depth_m / (median_inv + eps)
+
+    return depth_pred, depth_scale
+
+def lift_hands_to_3d(hand_data, depth, camera_matrix, image_shape=None, depth_scale: float = None):
     """Lift 2D hand landmarks to 3D using depth map.
     - Convert MediaPipe normalized coords to *image* pixel coordinates (for correct overlay).
     - Sample the MiDaS depth map by mapping image pixels into depth-map coordinates.
@@ -146,6 +170,8 @@ def lift_hands_to_3d(hand_data, depth, camera_matrix, image_shape=None):
     Args:
         image_shape: optional (height, width) of the original RGB frame. If omitted,
                      depth.shape will be used as a fallback (but that may cause misalignment).
+        depth_scale: optional per-frame scale so that final z_m = (1.0/depth_value) * depth_scale.
+                     If omitted, falls back to previous empirical mapping (0.5 / depth_value).
     """
     # Depth map resolution
     depth_h, depth_w = depth.shape[:2]
@@ -196,8 +222,16 @@ def lift_hands_to_3d(hand_data, depth, camera_matrix, image_shape=None):
                                + v01 * (1 - dx) * dy
                                + v11 * dx * dy)
 
-                # Convert MiDaS inverse-depth-ish output to approximate metric z (empirical)
-                z = 0.5 / (depth_value + 1e-6)
+                # Convert MiDaS output to metric depth.
+                # If a per-frame depth_scale was provided use:
+                #    z = (1.0 / depth_value) * depth_scale
+                # Otherwise fall back to the older empirical constant mapping.
+                eps = 1e-6
+                if depth_scale is not None:
+                    inv = 1.0 / (depth_value + eps)
+                    z = float(inv * depth_scale)
+                else:
+                    z = 0.5 / (depth_value + eps)
 
                 # Unproject using IMAGE pixel coords (camera intrinsics are image-based)
                 x_3d = (x_px_img - cx) * z / fx
@@ -209,16 +243,16 @@ def lift_hands_to_3d(hand_data, depth, camera_matrix, image_shape=None):
     return hand_data
 
 
-def process_single_frame(frame_bgr, timestamp, hands_model, midas, midas_transforms, camera_matrix, device=None, depth_downscale=1, timing_list=None):
+def process_single_frame(frame_bgr, timestamp, hands_model, midas, midas_transforms, camera_matrix, device=None, depth_downscale=1, timing_list=None, nominal_depth_m: float = DEFAULT_NOMINAL_DEPTH_M):
     """Run detection + depth + lift for a single BGR frame and return `hand_data`."""
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
     hand_data = detect_hands(hands_model, rgb)
-    depth = estimate_depth(midas, midas_transforms, rgb, device=device, downscale=depth_downscale, timing_list=timing_list)
-    hand_data = lift_hands_to_3d(hand_data, depth, camera_matrix, image_shape=rgb.shape[:2])
+    depth_pred, depth_scale = estimate_depth(midas, midas_transforms, rgb, device=device, downscale=depth_downscale, timing_list=timing_list, nominal_depth_m=nominal_depth_m)
+    hand_data = lift_hands_to_3d(hand_data, depth_pred, camera_matrix, image_shape=rgb.shape[:2], depth_scale=depth_scale)
     return hand_data
 
 
-def process_frames(cap, timestamps, hands, midas, midas_transforms, camera_matrix, total_frames, device=None, sample_rate: int = DEFAULT_SAMPLE_RATE, depth_downscale: int = DEFAULT_DEPTH_DOWNSCALE, imu_poses=None):
+def process_frames(cap, timestamps, hands, midas, midas_transforms, camera_matrix, total_frames, device=None, sample_rate: int = DEFAULT_SAMPLE_RATE, depth_downscale: int = DEFAULT_DEPTH_DOWNSCALE, nominal_depth_m: float = DEFAULT_NOMINAL_DEPTH_M, imu_poses=None):
     """Process video frames with hand tracking, depth estimation and pose tracking.
 
     New parameters:
@@ -263,7 +297,7 @@ def process_frames(cap, timestamps, hands, midas, midas_transforms, camera_matri
         prev_frame = gray
 
         # Detection + depth + lift (modular helper) -- collect MiDaS timing
-        hand_data = process_single_frame(frame, timestamps[frame_idx], hands, midas, midas_transforms, camera_matrix, device=device, depth_downscale=depth_downscale, timing_list=midas_timings)
+        hand_data = process_single_frame(frame, timestamps[frame_idx], hands, midas, midas_transforms, camera_matrix, device=device, depth_downscale=depth_downscale, timing_list=midas_timings, nominal_depth_m=nominal_depth_m)
 
         t = timestamps[frame_idx]
 
@@ -348,9 +382,9 @@ def process_frames(cap, timestamps, hands, midas, midas_transforms, camera_matri
         
         # Hand detection and depth
         hand_data = detect_hands(hands, rgb)
-        depth = estimate_depth(midas, midas_transforms, rgb)
+        depth_pred, depth_scale = estimate_depth(midas, midas_transforms, rgb, nominal_depth_m=DEFAULT_NOMINAL_DEPTH_M)
         # Pass the original image size so 2D pixel coords are computed in IMAGE space
-        hand_data = lift_hands_to_3d(hand_data, depth, camera_matrix, image_shape=rgb.shape[:2])
+        hand_data = lift_hands_to_3d(hand_data, depth_pred, camera_matrix, image_shape=rgb.shape[:2], depth_scale=depth_scale)
         
         t = timestamps[frame_idx]
         
@@ -509,6 +543,7 @@ def main():
     parser.add_argument('--depth-downscale', type=int, default=DEFAULT_DEPTH_DOWNSCALE, help='Downscale factor for MiDaS input')
     parser.add_argument('--no-gpu', action='store_true', help='Disable GPU even if available')
     parser.add_argument('--gpu', action='store_true', help='Force GPU usage (error if not available)')
+    parser.add_argument('--nominal-depth', type=float, default=DEFAULT_NOMINAL_DEPTH_M, help='Nominal scene depth (meters) used to scale MiDaS outputs')
     args = parser.parse_args()
 
     # Decide whether to use CUDA: --gpu explicitly requests it, otherwise use_cuda unless --no-gpu set
@@ -518,7 +553,7 @@ def main():
 
     # Process frames (may be limited via CLI args)
     max_frames = args.max_frames if (hasattr(args, 'max_frames') and args.max_frames > 0) else total_frames
-    print(f"   - Processing {max_frames} frames (sample_rate={args.sample_rate}, depth_downscale={args.depth_downscale})")
+    print(f"   - Processing {max_frames} frames (sample_rate={args.sample_rate}, depth_downscale={args.depth_downscale}, nominal_depth={args.nominal_depth} m)")
 
     midas, midas_transforms, hands, camera_matrix, device = initialize_models(use_cuda=use_cuda)
     print(f"   - MiDaS depth estimator loaded (device={device})")
@@ -570,7 +605,7 @@ def main():
     print("   - Note: IMU available for future fusion with visual odometry")
     
     print("\n4. Processing video frames...")
-    frames = process_frames(cap, timestamps, hands, midas, midas_transforms, camera_matrix, max_frames, device=device, sample_rate=args.sample_rate, depth_downscale=args.depth_downscale)
+    frames = process_frames(cap, timestamps, hands, midas, midas_transforms, camera_matrix, max_frames, device=device, sample_rate=args.sample_rate, depth_downscale=args.depth_downscale, nominal_depth_m=args.nominal_depth)
     
     print("\n5. Saving unified JSON...")
     save_unified_json(frames, fps)
