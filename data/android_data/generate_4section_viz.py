@@ -14,7 +14,12 @@ import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from mpl_toolkits.mplot3d import Axes3D
+from scipy.spatial.transform import Rotation as R
 import os
+
+# Head-stability defaults (tunable)
+HEAD_STABILITY_WINDOW = 3       # frames
+HEAD_ROT_THRESH_DEG = 5.0       # degrees (lenient default)
 
 # MediaPipe hand connections (indices for 21 landmarks)
 HAND_CONNECTIONS = [
@@ -181,8 +186,12 @@ def create_section3(frame, frame_data, camera_intrinsics):
     # No additional text or legends — section3 is deliberately minimal
     return overlay
 
-def create_section4(frame_data, width, height):
-    """Section 4: 3D matplotlib visualization."""
+def create_section4(frame_data, width, height, show_hands=True):
+    """Section 4: 3D matplotlib visualization.
+
+    If `show_hands` is False the camera/head is shown but hand points are suppressed
+    and an "Head unstable" label is added.
+    """
     # Create matplotlib figure
     fig = Figure(figsize=(width/100, height/100), dpi=100)
     canvas = FigureCanvasAgg(fig)
@@ -199,43 +208,40 @@ def create_section4(frame_data, width, height):
     camera_pos = pose_matrix[:3, 3]
     ax.scatter([camera_pos[0]], [camera_pos[1]], [camera_pos[2]], 
               c='green', marker='o', s=100, label='Camera')
-    
-    # Plot left hand (red)
-    if frame_data['hands']['left']['joints']:
-        left_joints = np.array(frame_data['hands']['left']['joints'])
-        ax.scatter(left_joints[:, 0], left_joints[:, 1], left_joints[:, 2],
-                  c='red', marker='o', s=20, label='Left Hand')
-        
-        # Draw connections
-        for connection in HAND_CONNECTIONS:
-            start_idx, end_idx = connection
-            if start_idx < len(left_joints) and end_idx < len(left_joints):
-                points = np.array([left_joints[start_idx], left_joints[end_idx]])
-                ax.plot3D(points[:, 0], points[:, 1], points[:, 2], 'r-', linewidth=1)
-        
-        # Add wrist label
-        wrist = left_joints[0]
-        ax.text(wrist[0], wrist[1], wrist[2], f'  L wrist: {wrist[2]:.3f}m', 
-               fontsize=8, color='red')
-    
-    # Plot right hand (blue)
-    if frame_data['hands']['right']['joints']:
-        right_joints = np.array(frame_data['hands']['right']['joints'])
-        ax.scatter(right_joints[:, 0], right_joints[:, 1], right_joints[:, 2],
-                  c='blue', marker='o', s=20, label='Right Hand')
-        
-        # Draw connections
-        for connection in HAND_CONNECTIONS:
-            start_idx, end_idx = connection
-            if start_idx < len(right_joints) and end_idx < len(right_joints):
-                points = np.array([right_joints[start_idx], right_joints[end_idx]])
-                ax.plot3D(points[:, 0], points[:, 1], points[:, 2], 'b-', linewidth=1)
-        
-        # Add wrist label
-        wrist = right_joints[0]
-        ax.text(wrist[0], wrist[1], wrist[2], f'  R wrist: {wrist[2]:.3f}m', 
-               fontsize=8, color='blue')
-    
+
+    if show_hands:
+        # Plot left hand (red)
+        if frame_data['hands']['left']['joints']:
+            left_joints = np.array(frame_data['hands']['left']['joints'])
+            ax.scatter(left_joints[:, 0], left_joints[:, 1], left_joints[:, 2],
+                      c='red', marker='o', s=20, label='Left Hand')
+            # Draw connections
+            for connection in HAND_CONNECTIONS:
+                start_idx, end_idx = connection
+                if start_idx < len(left_joints) and end_idx < len(left_joints):
+                    points = np.array([left_joints[start_idx], left_joints[end_idx]])
+                    ax.plot3D(points[:, 0], points[:, 1], points[:, 2], 'r-', linewidth=1)
+            # wrist label
+            wrist = left_joints[0]
+            ax.text(wrist[0], wrist[1], wrist[2], f'  L wrist: {wrist[2]:.3f}m', fontsize=8, color='red')
+
+        # Plot right hand (blue)
+        if frame_data['hands']['right']['joints']:
+            right_joints = np.array(frame_data['hands']['right']['joints'])
+            ax.scatter(right_joints[:, 0], right_joints[:, 1], right_joints[:, 2],
+                      c='blue', marker='o', s=20, label='Right Hand')
+            # Draw connections
+            for connection in HAND_CONNECTIONS:
+                start_idx, end_idx = connection
+                if start_idx < len(right_joints) and end_idx < len(right_joints):
+                    points = np.array([right_joints[start_idx], right_joints[end_idx]])
+                    ax.plot3D(points[:, 0], points[:, 1], points[:, 2], 'b-', linewidth=1)
+            wrist = right_joints[0]
+            ax.text(wrist[0], wrist[1], wrist[2], f'  R wrist: {wrist[2]:.3f}m', fontsize=8, color='blue')
+    else:
+        # Indicate head is unstable and hands are hidden
+        ax.text(camera_pos[0], camera_pos[1], camera_pos[2], '  Head unstable — hiding hands', fontsize=10, color='orange')
+
     # Add legend
     ax.legend(loc='upper right', fontsize=8)
     
@@ -260,6 +266,41 @@ def create_section4(frame_data, width, height):
     plt.close(fig)
     
     return img_bgr
+def is_head_stable(frames_data, idx, window=HEAD_STABILITY_WINDOW, rot_thresh_deg=HEAD_ROT_THRESH_DEG):
+    """Return True if head is stable over the last `window` frames.
+
+    - Prefer `camera_orientation_fused` when available (radian angles, xyz).
+    - Fallback: extract Euler from `camera_pose_world` rotation matrix.
+    """
+    start = max(0, idx - window + 1)
+    angles = []
+    for i in range(start, idx + 1):
+        fd = frames_data[i]
+        if 'camera_orientation_fused' in fd:
+            ang = np.asarray(fd['camera_orientation_fused'], dtype=float)
+            angles.append(ang)
+        elif 'imu_orientation' in fd:
+            ang = np.asarray(fd['imu_orientation'], dtype=float)
+            angles.append(ang)
+        else:
+            try:
+                Rmat = np.array(fd['camera_pose_world'])[:3, :3]
+                ang = R.from_matrix(Rmat).as_euler('xyz', degrees=False)
+                angles.append(ang)
+            except Exception:
+                # cannot evaluate — treat as unstable
+                return False
+
+    if len(angles) < 2:
+        return False
+
+    angles = np.asarray(angles)  # shape (k,3) in radians
+    # unwrap to avoid discontinuities then compute frame-to-frame diffs
+    angles_unwrapped = np.unwrap(angles, axis=0)
+    diffs = np.abs(np.diff(angles_unwrapped, axis=0))  # radians
+    diffs_deg = np.degrees(diffs)
+    max_change = np.max(diffs_deg)
+    return float(max_change) < float(rot_thresh_deg)
 
 def combine_sections(sec1, sec2, sec3, sec4):
     """Combine 4 sections into 2x2 grid."""
@@ -318,7 +359,10 @@ def generate_visualization():
         section1 = create_section1(frame)
         section2 = create_section2(frame, frame_data, camera_intrinsics)
         section3 = create_section3(frame, frame_data, camera_intrinsics)
-        section4 = create_section4(frame_data, width, height)
+
+        # Head-stability check (use fused orientation when present)
+        stable = is_head_stable(frames_data, idx, window=HEAD_STABILITY_WINDOW, rot_thresh_deg=HEAD_ROT_THRESH_DEG)
+        section4 = create_section4(frame_data, width, height, show_hands=stable)
         
         # Combine sections
         final_frame = combine_sections(section1, section2, section3, section4)
