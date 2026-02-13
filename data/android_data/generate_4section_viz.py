@@ -144,23 +144,41 @@ def create_section2(frame, frame_data, camera_intrinsics):
     return overlay
 
 def create_section3(frame, frame_data, camera_intrinsics):
-    """Section 3: MediaPipe overlay with depth values."""
+    """Section 3: same as MediaPipe overlay (section 2) but show *only* wrist depth
+    for each detected hand (displayed on the wrist joint). No other depth text or
+    overlays are added.
+    """
     overlay = frame.copy()
-    
-    # Draw left hand with depth (red)
+
+    # Draw left/right hands (same visual as Section 2, but no per-landmark depth)
     if frame_data['hands']['left']['joints']:
-        overlay = draw_hand_landmarks(overlay, frame_data['hands']['left'], 
-                                      (0, 0, 255), camera_intrinsics, draw_depth=True)
-    
-    # Draw right hand with depth (blue)
+        overlay = draw_hand_landmarks(overlay, frame_data['hands']['left'], (0, 0, 255), camera_intrinsics, draw_depth=False)
     if frame_data['hands']['right']['joints']:
-        overlay = draw_hand_landmarks(overlay, frame_data['hands']['right'], 
-                                      (255, 0, 0), camera_intrinsics, draw_depth=True)
-    
-    # Add text overlay
-    cv2.putText(overlay, "Depth Estimation (MiDaS)", (10, 30),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-    
+        overlay = draw_hand_landmarks(overlay, frame_data['hands']['right'], (255, 0, 0), camera_intrinsics, draw_depth=False)
+
+    # Draw wrist depth only (millimeters) at the wrist 2D pixel coordinate for each hand
+    for hand_key, color in [('left', (0, 0, 255)), ('right', (255, 0, 0))]:
+        hand = frame_data['hands'][hand_key]
+        if hand and hand.get('joints') and hand.get('joints_2d'):
+            try:
+                wrist_3d = hand['joints'][0]      # [x, y, z]
+                wrist_px = hand['joints_2d'][0]  # [x_px, y_px]
+                z_m = wrist_3d[2]
+                depth_text = f"{z_m*1000:.0f}mm"
+
+                x_px = int(wrist_px[0])
+                y_px = int(wrist_px[1])
+
+                # Draw a small filled background for legibility, then white text
+                text_pos = (x_px + 8, y_px - 8)
+                (tw, th), _ = cv2.getTextSize(depth_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                cv2.rectangle(overlay, (text_pos[0]-4, text_pos[1]-th-4), (text_pos[0]+tw+4, text_pos[1]+4), (0,0,0), -1)
+                cv2.putText(overlay, depth_text, text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1)
+            except Exception:
+                # keep overlay robust — if any field missing, skip
+                pass
+
+    # No additional text or legends — section3 is deliberately minimal
     return overlay
 
 def create_section4(frame_data, width, height):
