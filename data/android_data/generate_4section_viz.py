@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""
+Generate comprehensive 4-section visualization:
+1. Original video
+2. MediaPipe hand overlay with connections
+3. Depth values overlaid on hands
+4. 3D matplotlib visualization of hand tracking
+"""
+
+import json
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from mpl_toolkits.mplot3d import Axes3D
+import os
+
+# MediaPipe hand connections (indices for 21 landmarks)
+HAND_CONNECTIONS = [
+    # Thumb
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    # Index finger
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    # Middle finger
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    # Ring finger
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    # Pinky
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    # Palm
+    (5, 9), (9, 13), (13, 17)
+]
+
+def load_data():
+    """Load JSON data and video."""
+    print("Loading JSON data...")
+    with open('output/unified_hand_tracking_android.json') as f:
+        data = json.load(f)
+    
+    frames_data = data['frames']
+    camera_intrinsics = data['camera_intrinsics']
+    print(f"Loaded {len(frames_data)} frames")
+    print(f"Camera intrinsics: fx={camera_intrinsics['fx']}, fy={camera_intrinsics['fy']}, cx={camera_intrinsics['cx']}, cy={camera_intrinsics['cy']}")
+    
+    print("Loading video...")
+    cap = cv2.VideoCapture('video.mp4')
+    if not cap.isOpened():
+        raise ValueError("Cannot open video file")
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    print(f"Video: {width}x{height} @ {fps} fps")
+    
+    return frames_data, cap, fps, width, height, camera_intrinsics
+
+def draw_hand_landmarks(img, hand_data, color, camera_intrinsics, draw_depth=False):
+    """Draw hand landmarks and connections on image."""
+    if not hand_data['joints'] or hand_data['confidence'] == 0:
+        return img
+    
+    landmarks_3d = hand_data['joints']
+    
+    # Use stored 2D pixel coordinates directly (most accurate)
+    if 'joints_2d' in hand_data and hand_data['joints_2d']:
+        landmarks_2d = [(int(x), int(y)) for x, y in hand_data['joints_2d']]
+    else:
+        # Fallback: project 3D to 2D (less accurate due to depth estimation errors)
+        landmarks_2d = []
+        fx = camera_intrinsics['fx']
+        fy = camera_intrinsics['fy']
+        cx = camera_intrinsics['cx']
+        cy = camera_intrinsics['cy']
+        
+        for joint_3d in landmarks_3d:
+            x_3d, y_3d, z_3d = joint_3d
+            if z_3d > 0:
+                x_px = int(x_3d * fx / z_3d + cx)
+                y_px = int(y_3d * fy / z_3d + cy)
+            else:
+                x_px, y_px = int(cx), int(cy)
+            
+            x_px = max(0, min(img.shape[1] - 1, x_px))
+            y_px = max(0, min(img.shape[0] - 1, y_px))
+            landmarks_2d.append((x_px, y_px))
+    
+    # Draw connections
+    for connection in HAND_CONNECTIONS:
+        start_idx, end_idx = connection
+        if start_idx < len(landmarks_2d) and end_idx < len(landmarks_2d):
+            pt1 = landmarks_2d[start_idx]
+            pt2 = landmarks_2d[end_idx]
+            cv2.line(img, pt1, pt2, color, 2)
+    
+    # Draw landmarks
+    for idx, (x, y) in enumerate(landmarks_2d):
+        cv2.circle(img, (x, y), 4, color, -1)
+        cv2.circle(img, (x, y), 5, (255, 255, 255), 1)
+        
+        # Draw depth values if requested
+        if draw_depth and idx < len(landmarks_3d):
+            depth = landmarks_3d[idx][2]  # z-coordinate
+            depth_text = f"{depth*1000:.0f}mm"
+            cv2.putText(img, depth_text, (x+10, y-10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+    
+    return img
+
+def create_section1(frame):
+    """Section 1: Original video."""
+    return frame.copy()
+
+def create_section2(frame, frame_data, camera_intrinsics):
+    """Section 2: MediaPipe overlay with hand connections."""
+    overlay = frame.copy()
+    
+    # Draw left hand (red)
+    if frame_data['hands']['left']['joints']:
+        overlay = draw_hand_landmarks(overlay, frame_data['hands']['left'], 
+                                      (0, 0, 255), camera_intrinsics, draw_depth=False)
+    
+    # Draw right hand (blue)
+    if frame_data['hands']['right']['joints']:
+        overlay = draw_hand_landmarks(overlay, frame_data['hands']['right'], 
+                                      (255, 0, 0), camera_intrinsics, draw_depth=False)
+    
+    # Add text overlay
+    cv2.putText(overlay, "MediaPipe Hand Tracking", (10, 30),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
+    # Show confidence scores
+    if frame_data['hands']['left']['confidence'] > 0:
+        conf_text = f"L: {frame_data['hands']['left']['confidence']:.2f}"
+        cv2.putText(overlay, conf_text, (10, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+    
+    if frame_data['hands']['right']['confidence'] > 0:
+        conf_text = f"R: {frame_data['hands']['right']['confidence']:.2f}"
+        cv2.putText(overlay, conf_text, (10, 80),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+    
+    return overlay
+
+def create_section3(frame, frame_data, camera_intrinsics):
+    """Section 3: MediaPipe overlay with depth values."""
+    overlay = frame.copy()
+    
+    # Draw left hand with depth (red)
+    if frame_data['hands']['left']['joints']:
+        overlay = draw_hand_landmarks(overlay, frame_data['hands']['left'], 
+                                      (0, 0, 255), camera_intrinsics, draw_depth=True)
+    
+    # Draw right hand with depth (blue)
+    if frame_data['hands']['right']['joints']:
+        overlay = draw_hand_landmarks(overlay, frame_data['hands']['right'], 
+                                      (255, 0, 0), camera_intrinsics, draw_depth=True)
+    
+    # Add text overlay
+    cv2.putText(overlay, "Depth Estimation (MiDaS)", (10, 30),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+    
+    return overlay
+
+def create_section4(frame_data, width, height):
+    """Section 4: 3D matplotlib visualization."""
+    # Create matplotlib figure
+    fig = Figure(figsize=(width/100, height/100), dpi=100)
+    canvas = FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Set labels and title
+    ax.set_xlabel('X (m)')
+    ax.set_ylabel('Y (m)')
+    ax.set_zlabel('Z (m)')
+    ax.set_title('Hand Tracking 3D Visualization\n(Y is Up, XZ is Ground Plane)')
+    
+    # Camera/head position (green sphere)
+    pose_matrix = np.array(frame_data['camera_pose_world'])
+    camera_pos = pose_matrix[:3, 3]
+    ax.scatter([camera_pos[0]], [camera_pos[1]], [camera_pos[2]], 
+              c='green', marker='o', s=100, label='Camera')
+    
+    # Plot left hand (red)
+    if frame_data['hands']['left']['joints']:
+        left_joints = np.array(frame_data['hands']['left']['joints'])
+        ax.scatter(left_joints[:, 0], left_joints[:, 1], left_joints[:, 2],
+                  c='red', marker='o', s=20, label='Left Hand')
+        
+        # Draw connections
+        for connection in HAND_CONNECTIONS:
+            start_idx, end_idx = connection
+            if start_idx < len(left_joints) and end_idx < len(left_joints):
+                points = np.array([left_joints[start_idx], left_joints[end_idx]])
+                ax.plot3D(points[:, 0], points[:, 1], points[:, 2], 'r-', linewidth=1)
+        
+        # Add wrist label
+        wrist = left_joints[0]
+        ax.text(wrist[0], wrist[1], wrist[2], f'  L wrist: {wrist[2]:.3f}m', 
+               fontsize=8, color='red')
+    
+    # Plot right hand (blue)
+    if frame_data['hands']['right']['joints']:
+        right_joints = np.array(frame_data['hands']['right']['joints'])
+        ax.scatter(right_joints[:, 0], right_joints[:, 1], right_joints[:, 2],
+                  c='blue', marker='o', s=20, label='Right Hand')
+        
+        # Draw connections
+        for connection in HAND_CONNECTIONS:
+            start_idx, end_idx = connection
+            if start_idx < len(right_joints) and end_idx < len(right_joints):
+                points = np.array([right_joints[start_idx], right_joints[end_idx]])
+                ax.plot3D(points[:, 0], points[:, 1], points[:, 2], 'b-', linewidth=1)
+        
+        # Add wrist label
+        wrist = right_joints[0]
+        ax.text(wrist[0], wrist[1], wrist[2], f'  R wrist: {wrist[2]:.3f}m', 
+               fontsize=8, color='blue')
+    
+    # Add legend
+    ax.legend(loc='upper right', fontsize=8)
+    
+    # Set viewing angle
+    ax.view_init(elev=20, azim=45)
+    
+    # Set equal aspect ratio
+    max_range = 0.5  # meters
+    ax.set_xlim([camera_pos[0] - max_range, camera_pos[0] + max_range])
+    ax.set_ylim([camera_pos[1] - max_range, camera_pos[1] + max_range])
+    ax.set_zlim([camera_pos[2] - max_range, camera_pos[2] + max_range])
+    
+    # Add grid
+    ax.grid(True, alpha=0.3)
+    
+    # Convert to image
+    canvas.draw()
+    buf = canvas.buffer_rgba()
+    img = np.frombuffer(buf, dtype=np.uint8).reshape(height, width, 4)
+    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    
+    plt.close(fig)
+    
+    return img_bgr
+
+def combine_sections(sec1, sec2, sec3, sec4):
+    """Combine 4 sections into 2x2 grid."""
+    # Resize all sections to same size
+    h, w = sec1.shape[:2]
+    target_h, target_w = h // 2, w // 2
+    
+    sec1_small = cv2.resize(sec1, (target_w, target_h))
+    sec2_small = cv2.resize(sec2, (target_w, target_h))
+    sec3_small = cv2.resize(sec3, (target_w, target_h))
+    sec4_small = cv2.resize(sec4, (target_w, target_h))
+    
+    # Add section labels
+    cv2.putText(sec1_small, "1: Original Video", (10, 25),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(sec2_small, "2: Hand Tracking", (10, 25),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(sec3_small, "3: Depth Overlay", (10, 25),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    cv2.putText(sec4_small, "4: 3D Visualization", (10, 25),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    # Combine into 2x2 grid
+    top_row = np.hstack([sec1_small, sec2_small])
+    bottom_row = np.hstack([sec3_small, sec4_small])
+    combined = np.vstack([top_row, bottom_row])
+    
+    return combined
+
+def generate_visualization():
+    """Main function to generate 4-section visualization."""
+    print("=" * 60)
+    print("Generating 4-Section Comprehensive Visualization")
+    print("=" * 60)
+    
+    # Load data
+    frames_data, cap, fps, width, height, camera_intrinsics = load_data()
+    
+    # Setup output video
+    os.makedirs('output', exist_ok=True)
+    output_path = 'output/visualization_4section.mp4'
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    print(f"\nProcessing {len(frames_data)} frames...")
+    print("This will take several minutes...\n")
+    
+    for idx, frame_data in enumerate(frames_data):
+        # Read video frame
+        ret, frame = cap.read()
+        if not ret:
+            print(f"Warning: Could not read frame {idx}")
+            break
+        
+        # Generate all 4 sections
+        section1 = create_section1(frame)
+        section2 = create_section2(frame, frame_data, camera_intrinsics)
+        section3 = create_section3(frame, frame_data, camera_intrinsics)
+        section4 = create_section4(frame_data, width, height)
+        
+        # Combine sections
+        final_frame = combine_sections(section1, section2, section3, section4)
+        
+        # Write frame
+        out.write(final_frame)
+        
+        # Progress update
+        if idx % 50 == 0:
+            progress = (idx + 1) / len(frames_data) * 100
+            print(f"  Progress: {idx+1}/{len(frames_data)} frames ({progress:.1f}%)")
+    
+    # Cleanup
+    cap.release()
+    out.release()
+    
+    print(f"\n✓ Video saved to: {output_path}")
+    
+    # Show file info
+    import subprocess
+    result = subprocess.run(['ls', '-lh', output_path], capture_output=True, text=True)
+    print(result.stdout)
+    
+    result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 
+                           'format=duration', '-of', 
+                           'default=noprint_wrappers=1:nokey=1', output_path],
+                          capture_output=True, text=True)
+    if result.returncode == 0:
+        duration = float(result.stdout.strip())
+        print(f"Duration: {duration:.2f} seconds")
+    
+    print("\n" + "=" * 60)
+    print("Visualization complete!")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    generate_visualization()
